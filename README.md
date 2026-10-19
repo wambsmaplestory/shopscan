@@ -1,15 +1,8 @@
 # shop_scan
 
-A Violet Lua library (Classic) that reads player shops in the Free Market and hands each shop it reads to your script. It can scan the map you're on, every Free Market room on your channel, or every room on every channel. It handles entering and leaving shops, walking between rooms and changing channel.
-
-- **Author:** Wambs
-- **Needs:** a core with `core.player_shop` (Classic)
-
 ---
 
 ## Using it in a script
-
-There's nothing to install. Load it at the top of any script, outside any function:
 
 ```lua
 local shop_scan = require("wambs.shop_scan")
