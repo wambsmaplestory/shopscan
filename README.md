@@ -1,7 +1,5 @@
 # shop_scan
 
----
-
 ## Using it in a script
 
 ```lua
