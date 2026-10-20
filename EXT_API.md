@@ -3,7 +3,7 @@
 A read-only API for other applications (Violet scripts, bots, tools) to look up what is for sale in the Free Market:
 items, prices, which room and channel a shop is in, and which slot in the shop an item is in.
 
-- Base URL: `https://<your site>/api/external/v1`
+- Base URL: `https://test.moople.markets/api/external/v1`
 - Method: `GET` only. The API never changes anything on the site.
 - Format: JSON. Times are ISO-8601 in UTC. Prices are in mesos.
 
