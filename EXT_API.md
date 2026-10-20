@@ -1,9 +1,9 @@
 # External API
 
-A read-only API for other applications (bots, spreadsheets, tools) to look up what is for sale in the Free Market:
+A read-only API for other applications (Violet scripts, bots, tools) to look up what is for sale in the Free Market:
 items, prices, which room and channel a shop is in, and which slot in the shop an item is in.
 
-- Base URL: `https://test.moople.markets/api/external/v1`
+- Base URL: `https://<your site>/api/external/v1`
 - Method: `GET` only. The API never changes anything on the site.
 - Format: JSON. Times are ISO-8601 in UTC. Prices are in mesos.
 
@@ -139,8 +139,8 @@ stats=dex:3, acc:2          (any case, spaces are fine)
 Stat names: `STR`, `DEX`, `INT`, `LUK`, `HP`, `MP`, `W.ATK`, `M.ATK`, `W.DEF`, `M.DEF`, `ACC`, `AVOID`, `SPEED`,
 `JUMP`, `CRIT%`, `CRITDMG`.
 
-URL-encode the value when building URLs by hand: `%` in `CRIT%` becomes `%25`, and a space becomes `%20`. Most HTTP
-libraries do this for you when you pass parameters separately (see [Example code](#example-code)).
+URL-encode the value: `:` becomes `%3A`, `%` in `CRIT%` becomes `%25`, a space `%20`. The `url_encode` helper in
+[Example code](#example-code) does this.
 
 `min_slots` keeps pieces with at least that many upgrade slots left. A piece with fewer slots than the item normally has
 has been scrolled, so `min_slots` set to the item's normal slot count means "clean pieces only".
@@ -253,71 +253,239 @@ listing was last confirmed.
 
 ## Example code
 
-### curl
+### Lua (Violet)
 
-```bash
-curl -H "Authorization: Bearer $MMR_TOKEN" \
-  "https://<your site>/api/external/v1/listings?game_id=1082000&stats=DEX:3&limit=5"
-```
+A Violet script that looks up the cheapest listings of an item, optionally with stat minimums, and logs where to find
+each one. It uses `core.http.get` and `core.ui` from the Violet Lua SDK (see its documentation). Requests are
+asynchronous: the answer arrives in a callback on a later tick.
 
-### Python
+Violet has no JSON decoder, so the script includes a small one (`from_json`, the same parser `npc_auto_buyer.lua` uses).
+JSON `null` comes back as `nil`, so a missing key and a `null` value look the same: for example `l.equipment` is `nil`
+for items that aren't equipment.
 
-```python
-import time
-import requests
-
-BASE = "https://<your site>/api/external/v1"
-session = requests.Session()
-session.headers["Authorization"] = "Bearer mmr_..."
-
-
-def get(path, **params):
-    while True:
-        r = session.get(f"{BASE}{path}", params=params, timeout=30)
-        if r.status_code == 429:  # over the rate limit: wait and try again
-            time.sleep(int(r.headers.get("Retry-After", "5")))
-            continue
-        r.raise_for_status()
-        return r.json()
-
-
-def all_listings(**filters):
-    """Every listing matching the filters, following the pages."""
-    seen, offset = {}, 0
-    while True:
-        page = get("/listings", **filters, limit=500, offset=offset)
-        for listing in page["listings"]:
-            seen[listing["id"]] = listing  # by id: drops a listing that moved between pages
-        offset += page["limit"]
-        if offset >= page["total"]:
-            return sorted(seen.values(), key=lambda l: l["price"]["unit"])
-
-
-# The cheapest Work Gloves with at least 3 DEX that haven't been scrolled
-for l in all_listings(q="work gloves", stats="DEX:3", min_slots=5)[:5]:
-    print(f'{l["price"]["unit"]:>10,.0f}  ch{l["location"]["channel"]} FM{l["location"]["room"]}'
-          f'  {l["shop"]["seller"]} slot {l["shop"]["slot"]}  {l["equipment"]["stats"]}')
-```
-
-### JavaScript
-
-```js
-const BASE = "https://<your site>/api/external/v1";
-const headers = { Authorization: "Bearer mmr_..." };
-
-async function listings(params) {
-  const url = `${BASE}/listings?${new URLSearchParams(params)}`;
-  const r = await fetch(url, { headers });
-  if (!r.ok) throw new Error(`${r.status}: ${(await r.json()).detail}`);
-  return r.json();
+```lua
+plugin = {
+    name = "Market lookup",
+    version = "1.0.0",
+    author = "",
+    description = "Finds the cheapest listings of an item on Moople Markets and where they are",
+    load = true,
 }
 
-const { total, listings: cheapest } = await listings({ game_id: 2000006, max_price: 1000, limit: 10 });
-console.log(`${total} Mana Elixir listings at 1,000 or less`);
-for (const l of cheapest) {
-  console.log(l.price.unit, `ch${l.location.channel} FM${l.location.room}`, l.shop.seller, `slot ${l.shop.slot}`);
-}
+local PANEL = "Market lookup"
+local site = core.ui.input_text{ id = "site", label = "Moople Markets address", panel = PANEL,
+    default = "https://your-site" }
+local token = core.ui.input_text{ id = "token", label = "API token", panel = PANEL, default = "",
+    flags = { "password" }, tooltip = "From the site's Admin > API tokens (starts with mmr_)" }
+local item = core.ui.input_text{ id = "item", label = "Item number", panel = PANEL, default = "1082000" }
+local stats = core.ui.input_text{ id = "stats", label = "Stat minimums (optional)", panel = PANEL, default = "",
+    tooltip = "e.g. DEX:3,W.ATK:2" }
+local find = core.ui.button{ id = "find", label = "Find cheapest", panel = PANEL }
+
+---------------------------------------------------------------------------------------------------------------------
+-- JSON (Violet has no decoder)
+---------------------------------------------------------------------------------------------------------------------
+
+local function from_json(text)
+    if type(text) ~= "string" then return nil end
+    local pos = 1
+    local function skip() pos = text:find("[^ \t\r\n]", pos) or #text + 1 end
+    local value
+    local function utf8_char(code)
+        if code < 0x80 then return string.char(code) end
+        if code < 0x800 then return string.char(0xC0 + code // 64, 0x80 + code % 64) end
+        return string.char(0xE0 + code // 4096, 0x80 + (code // 64) % 64, 0x80 + code % 64)
+    end
+    local function str()
+        local out = {}
+        pos = pos + 1
+        while true do
+            local c = text:sub(pos, pos)
+            if c == "" then error("unterminated string") end
+            if c == '"' then pos = pos + 1; return table.concat(out) end
+            if c == "\\" then
+                local e = text:sub(pos + 1, pos + 1)
+                if e == "u" then
+                    table.insert(out, utf8_char(tonumber(text:sub(pos + 2, pos + 5), 16) or 63))
+                    pos = pos + 6
+                else
+                    table.insert(out, ({ b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" })[e] or e)
+                    pos = pos + 2
+                end
+            else
+                local stop = text:find('["\\]', pos) or #text + 1
+                table.insert(out, text:sub(pos, stop - 1))
+                pos = stop
+            end
+        end
+    end
+    value = function()
+        skip()
+        local c = text:sub(pos, pos)
+        if c == "{" then
+            local obj = {}
+            pos = pos + 1
+            skip()
+            if text:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+            while true do
+                skip()
+                if text:sub(pos, pos) ~= '"' then error("expected a key") end
+                local k = str()
+                skip()
+                if text:sub(pos, pos) ~= ":" then error("expected :") end
+                pos = pos + 1
+                obj[k] = value()
+                skip()
+                local sep = text:sub(pos, pos)
+                pos = pos + 1
+                if sep == "}" then return obj end
+                if sep ~= "," then error("expected , or }") end
+            end
+        elseif c == "[" then
+            local arr = {}
+            pos = pos + 1
+            skip()
+            if text:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+            while true do
+                table.insert(arr, value())
+                skip()
+                local sep = text:sub(pos, pos)
+                pos = pos + 1
+                if sep == "]" then return arr end
+                if sep ~= "," then error("expected , or ]") end
+            end
+        elseif c == '"' then
+            return str()
+        end
+        if text:sub(pos, pos + 3) == "true" then pos = pos + 4; return true end
+        if text:sub(pos, pos + 4) == "false" then pos = pos + 5; return false end
+        if text:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil end
+        local num = text:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+        if not num or num == "" then error("unexpected " .. c) end
+        pos = pos + #num
+        return tonumber(num)
+    end
+    local ok, result = pcall(value)
+    return ok and result or nil
+end
+
+---------------------------------------------------------------------------------------------------------------------
+-- Calling the API
+---------------------------------------------------------------------------------------------------------------------
+
+local function url_encode(s)
+    return (tostring(s):gsub("[^%w%-_%.~]", function(c) return string.format("%%%02X", string.byte(c)) end))
+end
+
+-- {game_id = 1082000, stats = "DEX:3"} -> "game_id=1082000&stats=DEX%3A3" (empty values are left out)
+local function query_string(params)
+    local parts = {}
+    for key, value in pairs(params) do
+        if value ~= nil and value ~= "" then table.insert(parts, key .. "=" .. url_encode(value)) end
+    end
+    return table.concat(parts, "&")
+end
+
+local retry_at, retry = 0, nil  -- after a 429: when to try again, and what
+
+local function header(response, name)
+    for key, value in pairs(response.headers or {}) do
+        if string.lower(key) == string.lower(name) then return value end
+    end
+    return nil
+end
+
+-- GET /api/external/v1<path>?<params>; callback(data) with the decoded answer, or callback(nil) on an error
+local function api_get(path, params, callback)
+    local base = site:get():match("^%s*(.-)/*%s*$")
+    local url = base .. "/api/external/v1" .. path .. "?" .. query_string(params)
+    local headers = { ["Authorization"] = "Bearer " .. token:get():match("^%s*(.-)%s*$") }
+    core.http.get(url, headers, function(response)
+        if response.status == 429 then  -- over the rate limit: on_tick tries again after Retry-After seconds
+            local wait = tonumber(header(response, "Retry-After") or "") or 5
+            retry_at = core.get_update_time() + wait * 1000
+            retry = function() api_get(path, params, callback) end
+            return
+        end
+        local data = from_json(response.body)
+        if response.status ~= 200 or data == nil then
+            local reason = (data and data.detail) or response.body or "no answer"
+            core.log_warning("[Market] " .. tostring(response.status) .. ": " .. tostring(reason))
+            return callback(nil)
+        end
+        callback(data)
+    end)
+end
+
+-- Every listing matching the filters, 500 per request, following the pages. done(list) gets them cheapest first,
+-- or done(nil) on an error.
+local function all_listings(filters, done)
+    local found, offset = {}, 0
+    local function next_page()
+        local params = { limit = 500, offset = offset }
+        for key, value in pairs(filters) do params[key] = value end
+        api_get("/listings", params, function(page)
+            if page == nil then return done(nil) end
+            for _, listing in ipairs(page.listings) do
+                found[listing.id] = listing  -- by id: a listing that moved between pages is kept once
+            end
+            offset = offset + page.limit
+            if offset < page.total then return next_page() end
+            local list = {}
+            for _, listing in pairs(found) do table.insert(list, listing) end
+            table.sort(list, function(a, b) return a.price.unit < b.price.unit end)
+            done(list)
+        end)
+    end
+    next_page()
+end
+
+local function stat_text(equipment)
+    if equipment == nil or equipment.stats == nil then return "" end
+    local parts = {}
+    for stat, value in pairs(equipment.stats) do table.insert(parts, stat .. " " .. tostring(value)) end
+    table.sort(parts)
+    return "  [" .. table.concat(parts, ", ") .. "; " .. tostring(equipment.upgrade_slots) .. " slots]"
+end
+
+---------------------------------------------------------------------------------------------------------------------
+-- The button
+---------------------------------------------------------------------------------------------------------------------
+
+function on_tick(stage)
+    if retry ~= nil and core.get_update_time() >= retry_at then
+        local again = retry
+        retry = nil
+        again()
+    end
+
+    if find:pressed() then
+        all_listings({ game_id = item:get(), stats = stats:get() }, function(list)
+            if list == nil then return end
+            if #list == 0 then return core.log("[Market] Nobody is selling that right now") end
+            core.log("[Market] " .. #list .. " listing(s) of " .. list[1].item.name .. ", cheapest first:")
+            for i = 1, math.min(5, #list) do
+                local l = list[i]
+                core.log(string.format("[Market] %s mesos each  ch %s, FM %s  %s's shop, slot %d (item %d)%s",
+                    string.format("%.0f", l.price.unit), tostring(l.location.channel), tostring(l.location.room),
+                    l.shop.seller, l.shop.slot or -1, (l.shop.slot or -1) + 1, stat_text(l.equipment)))
+            end
+        end)
+    end
+end
 ```
 
-Keep the token on a server. Don't put it in a web page or app that other people can open, since anyone who has it can
-use it until it is switched off in Admin › API tokens.
+Pressing **Find cheapest** with item `1082000` and stats `DEX:3` logs something like:
+
+```
+[Market] 4 listing(s) of Work Gloves, cheapest first:
+[Market] 15000 mesos each  ch 4, FM 3  Haste's shop, slot 2 (item 3)  [DEX 3; 5 slots]
+[Market] 22000 mesos each  ch 11, FM 8  Willnie's shop, slot 0 (item 1)  [DEX 4, W.DEF 3; 5 slots]
+...
+```
+
+To use other filters, change the table passed to `all_listings`, e.g. `{ q = "mana elixir", max_price = 1000 }` or
+`{ room = 8, channel = 11 }`. Any parameter from [GET /listings](#get-listings) works. For `/items`, call
+`api_get("/items", { q = "sauna robe" }, function(data) ... end)` and read `data.items`.
+
+Keep the token in the password field, not in the script file, so it isn't shared when the script is.
