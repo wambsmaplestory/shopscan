@@ -291,70 +291,167 @@ POST https://moople.markets/api/ingest/log
 
 ## Example code
 
-### Python
+### Lua
 
-A small client with a local queue: `record_shop` and `record_pass` add events as they happen, and `flush` sends what
-is waiting in batches. Uses the `requests` package.
+A Lua script with a local queue: `record_shop` and `record_pass` add events as they happen, and `on_tick` sends what
+is waiting in batches, keeping each event until the site has answered `200`. It is written for a scripting host (Lua 5.3
+or later) that provides an asynchronous HTTP client (`core.http.post(url, headers, body, callback)`, the callback
+getting `{status, body, headers}`), a millisecond clock (`core.get_update_time`), a small UI (`core.ui`), logging and a
+per-tick callback (`on_tick`); adapt those calls to your environment.
 
-```python
-import time
-from collections import deque
+The script includes a small JSON encoder (`to_json`) for environments without one. Lua can't tell an empty array
+from an empty object, so an empty table is sent as `[]`: leave `stats` out (nil) rather than sending it empty.
 
-import requests
+```lua
+plugin = {
+    name = "Market scanner upload",
+    version = "1.0.0",
+    author = "",
+    description = "Sends scanned shops and passes to Moople Markets",
+    load = true,
+}
 
-BASE = "https://moople.markets/api/ingest"
-TOKEN = "mmi_..."  # keep it out of shared code: read it from a file or environment variable
-BATCH = 200
+local PANEL = "Market upload"
+local site = core.ui.input_text{ id = "site", label = "Moople Markets address", panel = PANEL,
+    default = "https://moople.markets" }
+local token = core.ui.input_text{ id = "token", label = "Ingest token", panel = PANEL, default = "",
+    flags = { "password" }, tooltip = "Your Moople Markets ingest token (starts with mmi_)" }
 
-session = requests.Session()
-session.headers["Authorization"] = f"Bearer {TOKEN}"
-waiting = deque()  # (monotonic time it happened, event without age_ms)
+local BATCH = 200          -- events per request (the "batch" value from /ping)
+local RETRY_MS = 5000      -- wait after a 503 without Retry-After, or a network error
 
+---------------------------------------------------------------------------------------------------------------------
+-- JSON encoding
+---------------------------------------------------------------------------------------------------------------------
 
-def record_shop(owner, title, map_id, channel, lines):
-    """lines: [{"slot", "item_id", "price", "per_bundle", "bundles", "stats"?, "upgrade_slots"?}, ...] in shop order"""
-    waiting.append((time.monotonic(), {"type": "shop", "owner": owner, "title": title, "map_id": map_id,
-                                       "channel": channel, "items": lines}))
+local function is_array(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    for i = 1, n do
+        if t[i] == nil then return false end
+    end
+    return true  -- an empty table counts as an array: []
+end
 
+local function to_json(value)
+    local kind = type(value)
+    if value == nil then return "null" end
+    if kind == "boolean" then return value and "true" or "false" end
+    if kind == "number" then
+        if math.type(value) == "integer" then return string.format("%d", value) end
+        if value ~= value or value == math.huge or value == -math.huge then return "null" end
+        return string.format("%.17g", value)
+    end
+    if kind == "string" then
+        return '"' .. value:gsub('[%c"\\]', function(c)
+            local named = { ['"'] = '\\"', ["\\"] = "\\\\", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+            return named[c] or string.format("\\u%04x", string.byte(c))
+        end) .. '"'
+    end
+    if kind == "table" then
+        local parts = {}
+        if is_array(value) then
+            for _, item in ipairs(value) do table.insert(parts, to_json(item)) end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+        for key, item in pairs(value) do
+            table.insert(parts, to_json(tostring(key)) .. ":" .. to_json(item))
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    error("can't encode a " .. kind)
+end
 
-def record_pass(map_id, channel, owners):
-    waiting.append((time.monotonic(), {"type": "map_done", "map_id": map_id, "channel": channel,
-                                       "owners": list(owners)}))
+---------------------------------------------------------------------------------------------------------------------
+-- The local queue
+---------------------------------------------------------------------------------------------------------------------
 
+local waiting = {}    -- { at = when it happened (ms, core.get_update_time), event = the event without age_ms }
+local sending = false -- a request is out: send nothing else until it is answered (keeps the order)
+local next_try = 0    -- don't send before this time (after a 503 or a network error)
+local halted = nil    -- why sending stopped for good (bad token, not enabled, malformed request)
 
-def flush():
-    """Send everything waiting, oldest first. Returns False to try again later (the events stay queued)."""
-    while waiting:
-        chunk = list(waiting)[:BATCH]
-        now = time.monotonic()
-        events = [{**event, "age_ms": int((now - at) * 1000)} for at, event in chunk]  # recalculated every attempt
-        try:
-            answer = session.post(f"{BASE}/batch", json={"events": events}, timeout=30)
-        except requests.RequestException:
-            return False  # network trouble: try again later
-        if answer.status_code == 503 or answer.status_code >= 500:
-            time.sleep(int(answer.headers.get("Retry-After", 5)))
-            return False
-        if answer.status_code in (401, 404):
-            raise RuntimeError(f"ingest refused ({answer.status_code}): {answer.text}")
-        if answer.status_code == 422:
-            raise RuntimeError(f"malformed batch: {answer.text}")  # a bug in the client: fix it
-        for result, (_, event) in zip(answer.json()["results"], chunk):
-            if "error" in result:
-                print("rejected:", event.get("owner") or event["type"], result["error"])
-            waiting.popleft()
-    return True
+-- lines: { { slot = 0, item_id = 2000006, price = 9500, per_bundle = 100, bundles = 3 }, ... } in shop order.
+-- Equipment lines add stats = { ["1"] = 3, ["10"] = 4 } (stat code -> value) and upgrade_slots = 5.
+function record_shop(owner, title, map_id, channel, lines)
+    table.insert(waiting, { at = core.get_update_time(), event = {
+        type = "shop", owner = owner, title = title, map_id = map_id, channel = channel, items = lines } })
+end
 
+-- owners: the owner names of every shop seen in the room on this pass
+function record_pass(map_id, channel, owners)
+    table.insert(waiting, { at = core.get_update_time(), event = {
+        type = "map_done", map_id = map_id, channel = channel, owners = owners } })
+end
 
-# Example: one shop, then the pass through its room
-record_shop("Brickopolis", "cheap pots", 80002009, 8, [
-    {"slot": 0, "item_id": 2000006, "price": 9500, "per_bundle": 100, "bundles": 3},
-    {"slot": 1, "item_id": 1082000, "price": 15000, "per_bundle": 1, "bundles": 1,
-     "stats": {"1": 3, "10": 4}, "upgrade_slots": 5},
-])
-record_pass(80002009, 8, ["Brickopolis"])
-flush()
+---------------------------------------------------------------------------------------------------------------------
+-- Sending
+---------------------------------------------------------------------------------------------------------------------
+
+local function header(response, name)
+    for key, value in pairs(response.headers or {}) do
+        if string.lower(key) == string.lower(name) then return value end
+    end
+    return nil
+end
+
+local function send_waiting()
+    local now = core.get_update_time()
+    local count = math.min(#waiting, BATCH)
+    local events = {}
+    for i = 1, count do
+        local entry = waiting[i]
+        local event = { age_ms = math.max(0, math.floor(now - entry.at)) }  -- recalculated on every attempt
+        for key, value in pairs(entry.event) do event[key] = value end
+        events[i] = event
+    end
+
+    local url = site:get():match("^%s*(.-)/*%s*$") .. "/api/ingest/batch"
+    local headers = {
+        ["Authorization"] = "Bearer " .. token:get():match("^%s*(.-)%s*$"),
+        ["Content-Type"] = "application/json",
+    }
+    sending = true
+    core.http.post(url, headers, to_json({ events = events }), function(response)
+        sending = false
+        local status = response and response.status or 0
+        if status == 200 then
+            for _ = 1, count do table.remove(waiting, 1) end  -- received (stored, unchanged, duplicate or queued)
+            if response.body and response.body:find('"error"', 1, true) then
+                core.log_warning("[Upload] Some events were rejected: " .. response.body:sub(1, 500))
+            end
+        elseif status == 401 or status == 404 or status == 422 then
+            halted = tostring(status) .. ": " .. tostring(response.body)  -- retrying won't help: fix it first
+            core.log_error("[Upload] Stopped sending. " .. halted)
+        else  -- 503, another 5xx, or no answer: keep the events and try again
+            local wait = tonumber(header(response or {}, "Retry-After") or "")
+            next_try = core.get_update_time() + (wait and wait * 1000 or RETRY_MS)
+            core.log_warning("[Upload] Site unavailable (" .. tostring(status) .. "); " .. #waiting .. " event(s) kept")
+        end
+    end)
+end
+
+function on_tick(stage)
+    if halted == nil and not sending and #waiting > 0 and core.get_update_time() >= next_try then
+        send_waiting()
+    end
+end
 ```
+
+Using it from a scanner: when it has read a shop, and after it has walked a whole room:
+
+```lua
+record_shop("Brickopolis", "cheap pots", 80002009, 8, {
+    { slot = 0, item_id = 2000006, price = 9500, per_bundle = 100, bundles = 3 },
+    { slot = 1, item_id = 1082000, price = 15000, per_bundle = 1, bundles = 1,
+      stats = { ["1"] = 3, ["10"] = 4 }, upgrade_slots = 5 },
+})
+record_pass(80002009, 8, { "Brickopolis", "Haste" })
+```
+
+Only one request is out at a time, so events arrive in the order they were recorded. Everything waiting goes in one
+batch (up to 200 events), so a backlog after an outage is sent quickly. Keep the token in the password field, not in
+the script file, so it isn't shared when the script is.
 
 ### curl
 
