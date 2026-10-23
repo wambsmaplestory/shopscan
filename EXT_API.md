@@ -3,7 +3,7 @@
 A read-only API for other applications (Violet scripts, bots, tools) to look up what is for sale in the Free Market:
 items, prices, which room and channel a shop is in, and which slot in the shop an item is in.
 
-- Base URL: `https://test.moople.markets/api/external/v1`
+- Base URL: `https://moople.markets/api/external/v1`
 - Method: `GET` only. The API never changes anything on the site.
 - Format: JSON. Times are ISO-8601 in UTC. Prices are in mesos.
 
@@ -25,7 +25,13 @@ Ingest tokens (`mmi_...`) and being signed in to the site do not work here. A to
 refused straight away. Check a token with:
 
 ```
-GET /api/external/v1/ping
+GET https://moople.markets/api/external/v1/ping
+```
+
+From a terminal:
+
+```
+curl -H "Authorization: Bearer mmr_xxxxxxxx..." https://moople.markets/api/external/v1/ping
 ```
 
 ```json
@@ -40,9 +46,21 @@ GET /api/external/v1/ping
 | [`GET /listings`](#get-listings) | Every listing that is for sale now, with price, room, channel, seller and slot, filtered however you need |
 | `GET /ping` | Check that a token works |
 
+Paths below are relative to the base URL: `/items` means `https://moople.markets/api/external/v1/items`.
+
 What's included: listings that are for sale now, with a price the scanner could read, that aren't a price outlier
 (listed at many times the item's cheapest price), of items that are listed publicly on the site (items still waiting in
-Admin › Item review are left out). This is the same data as the market page.
+Admin › Item review are left out). This is the same data as the market page, always live: the API never uses the
+delayed hourly or 30-minute copies some of the site's visitors see.
+
+A listing stops being "for sale now" when:
+
+- a scan of its shop no longer shows it (sold, or taken down), or
+- its shop is closed: the scanner passed through the shop's room and channel and didn't see the shop, or
+- its shop hasn't been rescanned for 12 hours of scanning (the site's *Expire unseen listings after* setting). The clock
+  only runs while scans are arriving, so a scanner outage never empties the market.
+
+A shop that is scanned again later brings back whatever it still has for sale.
 
 ### GET /items
 
@@ -59,7 +77,7 @@ Search items. Each result is one item with a summary of its market.
 Results are sorted by name.
 
 ```
-GET /api/external/v1/items?q=sauna robe
+GET https://moople.markets/api/external/v1/items?q=sauna%20robe
 ```
 
 ```json
@@ -91,7 +109,7 @@ GET /api/external/v1/items?q=sauna robe
 | `npc_price` | What an NPC shop pays for one, or `null` if unknown. |
 | `listings` | How many listings it has now (`0` with `listed_only=false`). |
 | `cheapest_unit_price` | The cheapest price per item now, or `null` when nothing is listed. |
-| `average_sale_24h`, `average_sale_7d` | Average price per item it sold for in the last 24 hours / 7 days, or `null` with no sales. |
+| `average_sale_24h`, `average_sale_7d` | Average price per item it sold for in the last 24 hours / 7 days, or `null` with no sales. Updated by the site's statistics refresh, usually within a minute of a sale. |
 
 ### GET /listings
 
@@ -115,7 +133,7 @@ Every listing for sale now, with every filter optional. With no filters you get 
 Filters combine: a listing must match all of them.
 
 ```
-GET /api/external/v1/listings?game_id=1050010&room=9&limit=1
+GET https://moople.markets/api/external/v1/listings?game_id=1050010&room=9&limit=1
 ```
 
 ```json
@@ -248,15 +266,20 @@ Errors are JSON: `{"detail": "<what went wrong>"}`.
 
 **Rate limit:** 120 requests a minute per token. With `limit=500` that is up to 60,000 listings a minute.
 
-**How fresh is it:** listings update as the scanner sends shops, usually within seconds. `last_seen_at` says when each
-listing was last confirmed.
+**How fresh is it:**
+
+- Listings, `listings` and `cheapest_unit_price` change as the scanner sends shops, usually within seconds. When the
+  site is busy, new scans wait briefly in an import queue first, so they can occasionally be a minute or two behind.
+- `average_sale_24h` and `average_sale_7d` come from the site's statistics refresh, usually within a minute of a sale.
+- `last_seen_at` says when each listing was last confirmed. It is the time the scanner read the shop, not the time the
+  site stored it.
 
 ## Example code
 
 ### Lua (Violet)
 
 A Violet script that looks up the cheapest listings of an item, optionally with stat minimums, and logs where to find
-each one. It uses `core.http.get` and `core.ui` from the Violet Lua SDK (see its documentation). Requests are
+each one. It uses `core.http.get` and `core.ui` from the Violet Lua SDK (see its `llm-reference.txt`). Requests are
 asynchronous: the answer arrives in a callback on a later tick.
 
 Violet has no JSON decoder, so the script includes a small one (`from_json`, the same parser `npc_auto_buyer.lua` uses).
@@ -274,7 +297,7 @@ plugin = {
 
 local PANEL = "Market lookup"
 local site = core.ui.input_text{ id = "site", label = "Moople Markets address", panel = PANEL,
-    default = "https://your-site" }
+    default = "https://moople.markets" }
 local token = core.ui.input_text{ id = "token", label = "API token", panel = PANEL, default = "",
     flags = { "password" }, tooltip = "From the site's Admin > API tokens (starts with mmr_)" }
 local item = core.ui.input_text{ id = "item", label = "Item number", panel = PANEL, default = "1082000" }
