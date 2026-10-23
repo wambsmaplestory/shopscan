@@ -1,6 +1,6 @@
 # External API
 
-A read-only API for other applications (Violet scripts, bots, tools) to look up what is for sale in the Free Market:
+A read-only API for other applications (scripts, tools, other sites) to look up what is for sale in the Free Market:
 items, prices, which room and channel a shop is in, and which slot in the shop an item is in.
 
 - Base URL: `https://moople.markets/api/external/v1`
@@ -13,8 +13,8 @@ Contents: [Authentication](#authentication) · [Endpoints](#endpoints) · [Recip
 
 ## Authentication
 
-Every request needs an API token. An administrator makes one in **Admin › API tokens**; it starts with `mmr_` and is
-shown only once, so store it somewhere safe. Send it in either header:
+Every request needs an API token, issued by the Moople Markets team. It starts with `mmr_`; keep it somewhere safe and
+don't share it. Send it in either header:
 
 ```
 Authorization: Bearer mmr_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -35,7 +35,7 @@ curl -H "Authorization: Bearer mmr_xxxxxxxx..." https://moople.markets/api/exter
 ```
 
 ```json
-{"ok": true, "token": "Price bot", "world": "Classic"}
+{"ok": true, "token": "Price lookup", "world": "Classic"}
 ```
 
 ## Endpoints
@@ -49,16 +49,15 @@ curl -H "Authorization: Bearer mmr_xxxxxxxx..." https://moople.markets/api/exter
 Paths below are relative to the base URL: `/items` means `https://moople.markets/api/external/v1/items`.
 
 What's included: listings that are for sale now, with a price the scanner could read, that aren't a price outlier
-(listed at many times the item's cheapest price), of items that are listed publicly on the site (items still waiting in
-Admin › Item review are left out). This is the same data as the market page, always live: the API never uses the
+(listed at many times the item's cheapest price), of items that are listed publicly on the site. This is the same data as the market page, always live: the API never uses the
 delayed hourly or 30-minute copies some of the site's visitors see.
 
 A listing stops being "for sale now" when:
 
 - a scan of its shop no longer shows it (sold, or taken down), or
 - its shop is closed: the scanner passed through the shop's room and channel and didn't see the shop, or
-- its shop hasn't been rescanned for 12 hours of scanning (the site's *Expire unseen listings after* setting). The clock
-  only runs while scans are arriving, so a scanner outage never empties the market.
+- its shop hasn't been rescanned for 12 hours of scanning. The clock only runs while scans are arriving, so a scanner
+  outage never empties the market.
 
 A shop that is scanned again later brings back whatever it still has for sale.
 
@@ -276,13 +275,14 @@ Errors are JSON: `{"detail": "<what went wrong>"}`.
 
 ## Example code
 
-### Lua (Violet)
+### Lua
 
-A Violet script that looks up the cheapest listings of an item, optionally with stat minimums, and logs where to find
-each one. It uses `core.http.get` and `core.ui` from the Violet Lua SDK (see its `llm-reference.txt`). Requests are
-asynchronous: the answer arrives in a callback on a later tick.
+A Lua script that looks up the cheapest listings of an item, optionally with stat minimums, and logs where to find
+each one. It is written for a scripting host that provides an asynchronous HTTP client (`core.http.get`), a small UI
+(`core.ui`) and a per-tick callback (`on_tick`); adapt those calls to your environment. Requests are asynchronous: the
+answer arrives in a callback on a later tick.
 
-Violet has no JSON decoder, so the script includes a small one (`from_json`, the same parser `npc_auto_buyer.lua` uses).
+The script includes a small JSON decoder (`from_json`) for environments without one.
 JSON `null` comes back as `nil`, so a missing key and a `null` value look the same: for example `l.equipment` is `nil`
 for items that aren't equipment.
 
@@ -299,14 +299,14 @@ local PANEL = "Market lookup"
 local site = core.ui.input_text{ id = "site", label = "Moople Markets address", panel = PANEL,
     default = "https://moople.markets" }
 local token = core.ui.input_text{ id = "token", label = "API token", panel = PANEL, default = "",
-    flags = { "password" }, tooltip = "From the site's Admin > API tokens (starts with mmr_)" }
+    flags = { "password" }, tooltip = "Your Moople Markets API token (starts with mmr_)" }
 local item = core.ui.input_text{ id = "item", label = "Item number", panel = PANEL, default = "1082000" }
 local stats = core.ui.input_text{ id = "stats", label = "Stat minimums (optional)", panel = PANEL, default = "",
     tooltip = "e.g. DEX:3,W.ATK:2" }
 local find = core.ui.button{ id = "find", label = "Find cheapest", panel = PANEL }
 
 ---------------------------------------------------------------------------------------------------------------------
--- JSON (Violet has no decoder)
+-- JSON decoding
 ---------------------------------------------------------------------------------------------------------------------
 
 local function from_json(text)
